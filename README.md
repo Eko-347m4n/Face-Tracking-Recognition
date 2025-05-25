@@ -85,5 +85,3 @@ You can adjust the following parameters at the top of `main.py`:
 
 *   The `images/` directory is included in `.gitignore` and will not be tracked by Git. This is to prevent large image datasets from being committed to the repository.
 *   Performance can vary depending on your CPU and webcam resolution. Adjust `FRAME_RESIZE_FACTOR` and `FRAMES_TO_SKIP_AFTER_DETECTION` for optimal performance on your system.
-
-```
