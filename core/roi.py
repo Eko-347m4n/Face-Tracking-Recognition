@@ -84,7 +84,8 @@ def draw_roi_boundary(frame, roi_coords, color=(255, 0, 0), thickness=2):
     roi_x, roi_y, roi_w, roi_h = roi_coords
     if roi_w > 0 and roi_h > 0: # Hanya gambar jika ROI valid
         cv2.rectangle(frame, (roi_x, roi_y), (roi_x + roi_w, roi_y + roi_h), color, thickness)
-        cv2.putText(frame, 'ROI', (roi_x, roi_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, thickness)
+    
+        cv2.putText(frame, 'AREA SCAN', (roi_x, roi_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, thickness)
 
 if __name__ == '__main__':
     # Contoh penggunaan untuk menguji roi.py secara independen

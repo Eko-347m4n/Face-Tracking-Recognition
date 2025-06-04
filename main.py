@@ -1,7 +1,8 @@
 import cv2
 import mediapipe as mp 
 import logging
-import time 
+import time
+import os # Added for path operations
 from core import display 
 from core import roi as roi_module 
 from core import dataset_manager
@@ -27,21 +28,44 @@ ROI_H_FACTOR = 0.95   # Tinggi ROI 95% dari tinggi frame
 QUEUE_SIZE = 2 # Max size for inter-thread queues
 ADAPTIVE_ROI_PADDING = 30 # Pixels padding around detected faces for adaptive ROI
 
+# New configurations for dataset auto-reloading
+DATASET_AUTO_RELOAD_ENABLED = True  # Enable/disable automatic dataset reloading
+DATASET_CHECK_INTERVAL_SECONDS = 30 # How often to check for dataset changes (in seconds)
+
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Constants ---
 UNKNOWN_FACE_ID = "---" # ID untuk wajah tidak dikenal
 
+# --- Helper Function for Dataset Snapshot ---
+def get_dataset_snapshot(dataset_path):
+    """
+    Gets a set of image file paths in the dataset directory.
+    Used to detect changes in the dataset.
+    """
+    image_files = []
+    if not os.path.isdir(dataset_path):
+        logging.warning(f"Dataset path '{dataset_path}' does not exist or is not a directory.")
+        return set()
+    for root, _, files in os.walk(dataset_path):
+        for file in files:
+            # Consider common image extensions
+            if file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
+                image_files.append(os.path.join(root, file))
+    return set(sorted(image_files)) # Sort for consistent set comparison
+
 # --- Main Application ---
 def main():
     # 1. Load known faces from the dataset
+    logging.info(f"Loading initial dataset from: {DATASET_PATH}")
     known_face_encodings, known_face_labels, known_face_ids = \
         dataset_manager.load_known_faces_from_dataset(DATASET_PATH)
 
     # 2. Initialize webcam
     video_capture = camera_handler.initialize_webcam(WEBCAM_ID)
     if not video_capture:
+        logging.error("Failed to initialize webcam. Exiting application.")
         return
 
     # 3. Configure and Initialize Processing Pipeline
@@ -64,19 +88,31 @@ def main():
         'MEDIAPIPE_MIN_DETECTION_CONFIDENCE': MEDIAPIPE_MIN_DETECTION_CONFIDENCE
     }
 
-    # 2.5 Initialize MediaPipe Face Detection (using parameters from pipeline_config)
+    # For dataset auto-reloading
+    current_dataset_snapshot = None
+    last_dataset_check_time = 0
+    if DATASET_AUTO_RELOAD_ENABLED:
+        current_dataset_snapshot = get_dataset_snapshot(DATASET_PATH)
+        last_dataset_check_time = time.time()
+    if not known_face_encodings:
+        logging.warning("Initial dataset load resulted in zero known faces. Recognition will be limited.")
+    else:
+        logging.info(f"Initial dataset loaded. Found {len(known_face_encodings)} known faces.")
+
+    # Initialize MediaPipe Face Detection (reused across pipeline restarts)
     mp_face_detection_solution = mp.solutions.face_detection
     mp_face_detector = mp_face_detection_solution.FaceDetection(
         model_selection=pipeline_config['MEDIAPIPE_MODEL_SELECTION'],
         min_detection_confidence=pipeline_config['MEDIAPIPE_MIN_DETECTION_CONFIDENCE']
     )
 
-    pipeline = processing_pipeline.FaceProcessingPipeline(
+    # Initialize and start the processing pipeline
+    active_pipeline = processing_pipeline.FaceProcessingPipeline(
         video_capture, mp_face_detector,
         known_face_encodings, known_face_labels, known_face_ids,
         pipeline_config
     )
-    pipeline.start()
+    active_pipeline.start()
 
     logging.info("Application started. Press 'q' on the video window to quit.")
 
@@ -94,11 +130,74 @@ def main():
 
     quit_signal_received = False
     while not quit_signal_received:
-        display_data = pipeline.get_display_data(timeout=0.01) # Short timeout for responsiveness
+        current_time_loop = time.time()
 
-        if display_data:
+        # --- Dataset Auto-Reload Logic ---
+        if DATASET_AUTO_RELOAD_ENABLED and \
+           (current_time_loop - last_dataset_check_time > DATASET_CHECK_INTERVAL_SECONDS):
+            logging.debug(f"Checking for dataset changes in '{DATASET_PATH}'...")
+            new_snapshot = get_dataset_snapshot(DATASET_PATH)
+            
+            if new_snapshot != current_dataset_snapshot:
+                logging.info("Dataset change detected. Reloading known faces and restarting pipeline...")
+                
+                if active_pipeline:
+                    active_pipeline.stop() # Signal and wait for threads to join
+                    logging.info("Old pipeline stopped.")
+
+                # --- Force re-scan by deleting the pickle file ---
+                pickle_file_path = os.path.join(DATASET_PATH, "dataset_encodings.pkl")
+                if os.path.exists(pickle_file_path):
+                    try:
+                        os.remove(pickle_file_path)
+                        logging.info(f"Removed '{pickle_file_path}' to force dataset re-scan upon change detection.")
+                    except OSError as e:
+                        logging.warning(f"Could not remove pickle file '{pickle_file_path}' for re-scan: {e}")
+                # --- End force re-scan ---
+
+                # Reload known faces
+                # dataset_manager will now re-process images as pickle is removed
+                known_face_encodings, known_face_labels, known_face_ids = \
+                    dataset_manager.load_known_faces_from_dataset(DATASET_PATH)
+                
+                if not known_face_encodings:
+                    logging.warning("Dataset reload resulted in zero known faces. Recognition will be limited.")
+                else:
+                    logging.info(f"Dataset reloaded. Found {len(known_face_encodings)} known faces.")
+                
+                current_dataset_snapshot = new_snapshot
+                
+                # Re-initialize and start a new pipeline
+                active_pipeline = processing_pipeline.FaceProcessingPipeline(
+                    video_capture, mp_face_detector, # Reuse video_capture and mp_face_detector
+                    known_face_encodings, known_face_labels, known_face_ids,
+                    pipeline_config
+                )
+                active_pipeline.start()
+                logging.info("New pipeline started with updated dataset.")
+
+                # Reset display variables to wait for new pipeline's output
+                latest_frame_to_display = None
+                latest_face_locations = []
+                latest_face_details = []
+                current_roi_coords_for_drawing = None
+                latest_total_processing_time_ms = 0.0
+                # Reset FPS counter
+                fps_start_time = time.time() 
+                fps_frame_count = 0
+                displayed_fps = 0.0
+            
+            last_dataset_check_time = current_time_loop
+        # --- End of Dataset Auto-Reload Logic ---
+
+        # Attempt to get new data from the pipeline
+        new_display_data = None
+        if active_pipeline and not active_pipeline.stop_event.is_set():
+            new_display_data = active_pipeline.get_display_data(timeout=0.01) # Short timeout
+
+        if new_display_data:
             (frame_to_display, face_locs, face_dets, roi_coords,
-             det_time, id_time) = display_data
+             det_time, id_time) = new_display_data
 
             latest_frame_to_display = frame_to_display
             latest_face_locations = face_locs
@@ -106,16 +205,20 @@ def main():
             current_roi_coords_for_drawing = roi_coords
             latest_total_processing_time_ms = det_time + id_time
         elif latest_frame_to_display is None:
-            # No frame processed yet and no previous frame to show
-            if not video_capture.isOpened() and not pipeline.stop_event.is_set(): # Check if capture might have stopped
-                logging.info("Main loop: Video capture seems to have stopped early.")
-                break 
-            time.sleep(0.01) # Wait briefly
+            # No new data AND no previous frame to show (e.g., initial start or after pipeline reload)
+            if video_capture and not video_capture.isOpened():
+                if not active_pipeline or not active_pipeline.stop_event.is_set(): # If pipeline isn't already stopping
+                    logging.error("Video capture is not open. Stopping application.")
+                    quit_signal_received = True
+                    continue 
+            
+            logging.debug("Waiting for frame from pipeline...")
+            time.sleep(0.05) # Wait a bit for the pipeline to produce a frame
             continue
         
-        # If display_data is None but we have a latest_frame_to_display, continue showing it
-        if latest_frame_to_display is None: # Should only happen if pipeline stops before first frame
-            # No new processed frame, continue displaying the last one if available
+        # If latest_frame_to_display is still None here, it means we are waiting (e.g. after reload)
+        if latest_frame_to_display is None:
+            time.sleep(0.05) # Continue waiting
             continue
 
         # --- Display Logic (similar to before, but using latest_ variables) ---
@@ -123,12 +226,11 @@ def main():
 
         # Kalkulasi FPS
         fps_frame_count += 1
-        current_time = time.time()
-        elapsed_time = current_time - fps_start_time
-        if elapsed_time > 1.0: # Update FPS setiap 1 detik
-            displayed_fps = fps_frame_count / elapsed_time if elapsed_time > 0 else 0
+        elapsed_time_fps = current_time_loop - fps_start_time
+        if elapsed_time_fps > 1.0: 
+            displayed_fps = fps_frame_count / elapsed_time_fps if elapsed_time_fps > 0 else 0
             fps_frame_count = 0 # Reset frame count for next interval
-            fps_start_time = current_time
+            fps_start_time = current_time_loop
 
         # Gambar batas ROI pada frame jika diaktifkan dan koordinat tersedia
         if ROI_ENABLED and current_roi_coords_for_drawing:
@@ -154,20 +256,33 @@ def main():
         if display.show_frame(WINDOW_NAME, display_frame):
             logging.info("Quit signal received from display window.")
             quit_signal_received = True
-            break
+            # Loop will terminate, then cleanup runs.
         
-        if pipeline.stop_event.is_set() and display_data is None: # Pipeline stopped and queue is empty
-            logging.info("Main loop: Pipeline has stopped and display queue is empty.")
-            break
+        # If pipeline stopped for reasons other than quit signal (e.g. video file ended)
+        if active_pipeline and active_pipeline.stop_event.is_set() and not new_display_data and not quit_signal_received:
+            # This might indicate the source ended or an issue.
+            # Check if it's not immediately after a reload attempt.
+            is_during_reload_transition = DATASET_AUTO_RELOAD_ENABLED and \
+                                         (time.time() - last_dataset_check_time < 2.0) # Small window after check
+
+            if not is_during_reload_transition:
+                if video_capture and not video_capture.isOpened():
+                    logging.info("Pipeline stopped and video capture is closed. Assuming end of source or error.")
+                else:
+                    logging.warning("Pipeline stopped unexpectedly. Assuming end of source or error.")
+                quit_signal_received = True # Trigger shutdown
 
     # --- Cleanup ---
     logging.info("Main loop finished. Cleaning up threads and resources...")
-    pipeline.stop() # Signal and join threads within the pipeline class
-    video_capture.release()
+    if active_pipeline:
+        active_pipeline.stop() 
+    if video_capture:
+        video_capture.release()
     if mp_face_detector:
         mp_face_detector.close() # Release MediaPipe resources
     display.destroy_all_windows() # Use the display module's cleanup function
     logging.info("Application stopped and resources released.")
 
 if __name__ == '__main__':
+
     main()
