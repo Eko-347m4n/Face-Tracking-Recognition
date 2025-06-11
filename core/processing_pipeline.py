@@ -4,8 +4,11 @@ import logging
 import time
 import threading
 import queue
+import dlib
 from core import recognizer
 from core import roi as roi_module
+from core.anti_spoofing import BlinkDetector
+from core.face_utils import extract_face_roi
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +35,9 @@ class FaceProcessingPipeline:
 
         # Adaptive ROI bounding box (x, y, w, h) in original frame coordinates
         self.adaptive_roi = None
+
+        # Initialize BlinkDetector for anti-spoofing
+        self.blink_detector = BlinkDetector()
 
     def _detection_stage(self, original_frame):
         detection_start_time = time.time()
@@ -121,8 +127,9 @@ class FaceProcessingPipeline:
         current_face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations_in_rgb_small_frame)
         recognized_face_details = []
         face_locations_on_original_frame = []
+        liveness_statuses = []  # New list to hold liveness status per face
 
-        for face_encoding in current_face_encodings:
+        for i, face_encoding in enumerate(current_face_encodings):
             name, face_id = recognizer.recognize_face(
                 self.known_face_encodings, self.known_face_labels, self.known_face_ids,
                 face_encoding,
@@ -132,7 +139,8 @@ class FaceProcessingPipeline:
             )
             recognized_face_details.append((name, face_id))
 
-        for (top, right, bottom, left) in face_locations_in_rgb_small_frame:
+            # Get corresponding face location in original frame coordinates
+            top, right, bottom, left = face_locations_in_rgb_small_frame[i]
             top_rel = int(top / self.config['FRAME_RESIZE_FACTOR'])
             right_rel = int(right / self.config['FRAME_RESIZE_FACTOR'])
             bottom_rel = int(bottom / self.config['FRAME_RESIZE_FACTOR'])
@@ -144,8 +152,21 @@ class FaceProcessingPipeline:
             final_left = left_rel + roi_offset_x
             face_locations_on_original_frame.append((final_top, final_right, final_bottom, final_left))
 
+            # Prepare dlib.rectangle for landmarks
+            face_rect = dlib.rectangle(left=final_left, top=final_top, right=final_right, bottom=final_bottom)
+
+            # Extract grayscale ROI for blink detection
+            # Convert rgb_small_frame back to BGR for OpenCV if needed
+            # But we have only rgb_small_frame here, so we will extract from original frame in display queue later
+            # Instead, we will pass original frame to identification stage in future or refactor
+
+            # For now, we will skip liveness detection here and do it in identification thread with original frame
+
+            # Append placeholder for liveness status
+            liveness_statuses.append((False, "Liveness Unknown", 0.0))
+
         identification_time_ms = (time.time() - identification_start_time) * 1000
-        return face_locations_on_original_frame, recognized_face_details, identification_time_ms
+        return face_locations_on_original_frame, recognized_face_details, liveness_statuses, identification_time_ms
 
     def _capture_thread_func(self):
         logger.info("Capture thread started.")
@@ -211,11 +232,16 @@ class FaceProcessingPipeline:
                 if roi_for_display_during_tracking is None:
                     # Fallback if adaptive_roi was reset or never set
                     roi_for_display_during_tracking = (0, 0, original_frame.shape[1], original_frame.shape[0])
+                
+                # Create placeholder liveness statuses for tracked faces
+                liveness_statuses_for_tracked = []
+                for _ in tracked_details: # For each tracked face
+                    liveness_statuses_for_tracked.append((False, "Tracking", 0.0)) # is_live, status_text, ear_val
 
                 try:
                     # Pass the determined ROI for display
                     self.display_q.put(
-                        (original_frame, tracked_locs_orig, tracked_details,
+                        (original_frame, tracked_locs_orig, tracked_details, liveness_statuses_for_tracked,
                          roi_for_display_during_tracking, processing_time_ms, 0.0),
                         timeout=0.1
                     )
@@ -262,15 +288,31 @@ class FaceProcessingPipeline:
             if not face_locs_small: # No faces detected by MediaPipe in detection stage
                 self.adaptive_roi = None # Clear adaptive ROI if no faces are detected
                 try:
-                    self.display_q.put((original_frame, [], [], roi_coords, det_time, 0.0), timeout=0.1)
+                    self.display_q.put((original_frame, [], [], [], roi_coords, det_time, 0.0), timeout=0.1)
                 except queue.Full:
                     pass
                 continue
 
-            face_locs_orig, rec_details, id_time = self._identification_stage(
+            face_locs_orig, rec_details, liveness_statuses, id_time = self._identification_stage(
                 rgb_small, face_locs_small,
                 original_frame.shape, r_offset_x, r_offset_y
             )
+
+            # Perform liveness check for each face using BlinkDetector
+            updated_liveness_statuses = []
+            for i, face_rect_coords in enumerate(face_locs_orig):
+                top_o, right_o, bottom_o, left_o = face_rect_coords
+                face_id = rec_details[i][1] if i < len(rec_details) else None
+
+                # Create dlib.rectangle for face
+                face_rect = dlib.rectangle(left=left_o, top=top_o, right=right_o, bottom=bottom_o)
+
+                # Convert original frame to grayscale for blink detection
+                gray_frame = cv2.cvtColor(original_frame, cv2.COLOR_BGR2GRAY)
+
+                # Check liveness
+                is_live, status_text, ear_val = self.blink_detector.check_liveness(gray_frame, face_rect, face_id)
+                updated_liveness_statuses.append((is_live, status_text, ear_val))
 
             # If faces were identified and skipping is enabled, initialize trackers
             if face_locs_orig and rec_details and frames_to_skip_config > 0:
@@ -367,7 +409,7 @@ class FaceProcessingPipeline:
                 self.adaptive_roi = None  # Clear adaptive ROI if no faces
 
             try:
-                self.display_q.put((original_frame, face_locs_orig, rec_details, roi_coords, det_time, id_time), timeout=0.1)
+                self.display_q.put((original_frame, face_locs_orig, rec_details, liveness_statuses, roi_coords, det_time, id_time), timeout=0.1)
             except queue.Full:
                 pass
             except Exception as e:

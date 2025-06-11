@@ -1,6 +1,6 @@
 import cv2
 
-def draw_detections_on_frame(frame, face_locations, face_details, frame_resize_factor, unknown_person_label, fps=0.0, response_time_ms=0.0):
+def draw_detections_on_frame(frame, face_locations, face_details, liveness_statuses, frame_resize_factor, unknown_person_label, fps=0.0, response_time_ms=0.0):
     # Display FPS and Response Time (Waktu Pemrosesan)
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = 0.6
@@ -33,7 +33,7 @@ def draw_detections_on_frame(frame, face_locations, face_details, frame_resize_f
 
     # --- Gambar Deteksi Wajah (hanya jika face_locations tidak kosong) ---
     if face_locations: # Periksa apakah ada wajah untuk digambar
-        for (top, right, bottom, left), (name, face_id) in zip(face_locations, face_details):
+        for (top, right, bottom, left), (name, face_id), (is_live, status_text, ear_val) in zip(face_locations, face_details, liveness_statuses):
         # Scale back up face locations to original frame size
             top_orig = int(top / frame_resize_factor)
             right_orig = int(right / frame_resize_factor)
@@ -41,10 +41,15 @@ def draw_detections_on_frame(frame, face_locations, face_details, frame_resize_f
             left_orig = int(left / frame_resize_factor)
 
             box_color = (0, 255, 0) if name != unknown_person_label else (0, 0, 255)
+            # Change box color to red if spoof detected (not live)
+            if not is_live:
+                box_color = (0, 0, 255)
+
             cv2.rectangle(frame, (left_orig, top_orig), (right_orig, bottom_orig), box_color, 2)
 
             # Siapkan teks untuk ditampilkan
             display_text = f"{name} (ID: {face_id})" if name != unknown_person_label else name
+            display_text += f" | {status_text}"
             
             face_label_font = cv2.FONT_HERSHEY_DUPLEX
             face_label_font_scale = 0.5 
