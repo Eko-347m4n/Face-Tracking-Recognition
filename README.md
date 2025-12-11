@@ -1,87 +1,114 @@
-# Real-Time Face Recognition System
+# Face Tracking & Recognition System with Liveness Detection
 
-A Python-based real-time face recognition system that uses a webcam to detect and identify known faces from a dataset.
+A robust, real-time face recognition application engineered for performance and security. This system utilizes a multi-threaded architecture to perform face detection, tracking, and liveness verification (anti-spoofing) seamlessly on standard CPU hardware.
 
-## Features
+## 🟦 1. Tech Stack & Rationale
 
-*   **Dataset Loading:** Dynamically loads and encodes faces from an image dataset.
-*   **Real-Time Detection:** Captures video from a webcam and detects faces in real-time.
-*   **Face Recognition:** Compares detected faces against the known dataset.
-*   **Visual Feedback:**
-    *   Draws bounding boxes around detected faces.
-    *   Labels faces with their recognized name or "Tidak dikenal" (Unknown).
-    *   Bounding box color changes based on recognition status (Green for known, Red for unknown).
-*   **Performance Optimization:** Includes options for frame resizing and smart frame skipping to balance performance and responsiveness.
+We chose a specific stack to balance high-performance real-time processing with ease of maintenance:
 
-## Requirements
+*   **Core Vision: OpenCV**
+    *   *Why:* Industry standard for I/O and lightweight object tracking (`TrackerCSRT`).
+*   **Face Detection: MediaPipe**
+    *   *Why:* Superior CPU performance compared to HOG/CNN dlib models, essential for maintaining high FPS without a GPU.
+*   **Recognition: face_recognition (dlib wrapper)**
+    *   *Why:* Provides state-of-the-art accuracy (99.38%) with a clean, pythonic API for 128-d face encoding.
+*   **Anti-Spoofing: dlib (68 landmarks)**
+    *   *Why:* Required for precise facial landmark detection to calculate the Eye Aspect Ratio (EAR) for liveness validation.
 
-*   Python 3.7+
-*   OpenCV (`opencv-python`)
-*   face_recognition
-*   NumPy
+## 🟦 2. Architecture & Design
 
-## Setup & Installation
+The project follows a **Modular Monolith** structure to separate concerns effectively:
 
-1.  **Clone the repository (if applicable):**
+*   **`main.py` (Orchestrator):** Handles configuration, lifecycle management, and graceful shutdowns.
+*   **`core/` (Service Layer):**
+    *   `processing_pipeline.py`: The central controller managing the multi-threaded data flow.
+    *   `recognizer.py` & `anti_spoofing.py`: Pure domain logic modules.
+    *   `dataset_manager.py`: Data access layer handling caching and storage.
+    *   `display.py`: Presentation layer responsible for rendering the UI.
+
+## 🟦 3. Key Features & Business Logic
+
+### 🚀 Detect-then-Track Strategy
+To solve the latency problem inherent in face detection, we implement a hybrid approach:
+1.  **Expensive Detection:** `MediaPipe` is run periodically or when tracking fails.
+2.  **Cheap Tracking:** Between detections, `OpenCV Tracker` follows the object, drastically reducing CPU load.
+3.  **Adaptive ROI:** Search areas are dynamically reduced based on the last known face position.
+
+### 🛡️ Anti-Spoofing (Liveness Check)
+Security is paramount. The system validates that a detected face is "live" and not a static photograph:
+*   **Mechanism:** Uses `dlib` to predict 68 facial landmarks.
+*   **Algorithm:** Calculates the **Eye Aspect Ratio (EAR)** to detect natural blinking patterns. If no blink is detected over a set period, access is denied.
+
+### ⚡ Smart Caching
+Startup time is optimized by caching processed face encodings:
+*   **Logic:** `dataset_manager.py` checks file modification times.
+*   **Result:** If the dataset hasn't changed, encodings are loaded from a `.pkl` file in milliseconds, skipping the expensive re-encoding process.
+
+## 🟦 4. System Data Flow
+
+The application uses a **Multi-threaded Producer-Consumer** architecture to prevent UI blocking:
+
+1.  **Capture Thread:** Fetches raw frames from the camera $\rightarrow$ `frame_queue`.
+2.  **Detection Thread:** Consumes frames $\rightarrow$ Runs Detect/Track logic $\rightarrow$ Pushes results to `face_queue`.
+3.  **Identification Thread:** Consumes ROIs $\rightarrow$ Performs Encoding & Liveness Checks $\rightarrow$ Updates state.
+4.  **Main Thread:** Aggregates all data $\rightarrow$ Renders the final UI via `display.py`.
+
+## 📂 Project Structure
+
+```text
+/
+├── core/
+│   ├── anti_spoofing.py      # Liveness detection (blink analysis)
+│   ├── camera_handler.py     # Threaded camera I/O
+│   ├── dataset_manager.py    # Caching and dataset loading
+│   ├── display.py            # UI rendering (OpenCV drawing)
+│   ├── processing_pipeline.py# Core multi-threading logic
+│   ├── recognizer.py         # Face matching logic
+│   ├── roi.py                # Region of Interest utilities
+│   └── utils.py              # General helpers
+├── images/                   # Dataset directory
+├── main.py                   # Entry point
+└── requirements.txt          # Project dependencies
+```
+
+## 🛠️ Setup & Installation
+
+### Prerequisites
+*   Python 3.8+
+*   Webcam
+
+### Installation
+
+1.  **Clone the repository:**
     ```bash
-    git clone <your-repository-url>
-    cd <repository-folder>
+    git clone <repository-url>
+    cd Face-Tracking-Recognition
     ```
 
-2.  **Create a virtual environment (recommended):**
+2.  **Create a virtual environment:**
     ```bash
     python -m venv venv
-    source venv/bin/activate  # On Windows: venv\Scripts\activate
+    source venv/bin/activate  # Windows: venv\Scripts\activate
     ```
 
 3.  **Install dependencies:**
     ```bash
-    pip install opencv-python face_recognition numpy
+    pip install opencv-python opencv-contrib-python dlib face_recognition mediapipe numpy
     ```
+    *Note: Installing `dlib` may require CMake installed on your system.*
 
-4.  **Prepare the Dataset:**
-    *   Create a folder named `images/` in the project's root directory.
-    *   Place your dataset images (e.g., `.jpg`, `.png`) inside the `images/` folder.
-    *   Name your image files using the convention: `label_number.extension` (e.g., `john_1.jpg`, `jane_doe_1.png`, `john_2.jpg`). The part before the first underscore will be used as the person's name.
+4.  **Prepare Dataset:**
+    *   Put images of known people in the `images/` folder.
+    *   Filenames should be `Name_Identifier.jpg` (e.g., `Elon_1.jpg`). The system automatically extracts "Elon" as the label.
 
-## How to Run
+## 🚀 Usage
 
-Navigate to the project's root directory in your terminal and run:
-
+Run the main application:
 ```bash
 python main.py
 ```
 
-A window will pop up showing your webcam feed.
-*   Known faces will be highlighted with a **green** box and their name.
-*   Unknown faces will be highlighted with a **red** box and labeled "Tidak dikenal".
-
-Press 'q' while the video window is active to quit the application.
-
-## Project Structure
-
-```
-├── core/
-│   ├── __init__.py
-│   ├── utils.py         # Utility functions for image loading, encoding, label extraction
-│   └── recognizer.py    # Logic for comparing face encodings
-├── images/              # Folder for dataset images (ignored by Git)
-├── main.py              # Main script to run the application
-├── .gitignore           # Specifies intentionally untracked files
-└── README.md            # This file
-```
-
-## Configuration (in `main.py`)
-
-You can adjust the following parameters at the top of `main.py`:
-
-*   `DATASET_PATH`: Path to the dataset images folder (default: `"images/"`).
-*   `WEBCAM_ID`: Webcam device ID (default: `0`).
-*   `RECOGNITION_TOLERANCE`: How strict the face matching is (default: `0.6`). Lower is stricter.
-*   `FRAME_RESIZE_FACTOR`: Factor to resize webcam frames for faster processing (default: `0.25`). `1.0` for original size.
-*   `FRAMES_TO_SKIP_AFTER_DETECTION`: Number of frames to skip processing after a face is detected, to balance performance and responsiveness (default: `2`). Set to `0` to process every frame for maximum sensitivity to movement.
-
-## Notes
-
-*   The `images/` directory is included in `.gitignore` and will not be tracked by Git. This is to prevent large image datasets from being committed to the repository.
-*   Performance can vary depending on your CPU and webcam resolution. Adjust `FRAME_RESIZE_FACTOR` and `FRAMES_TO_SKIP_AFTER_DETECTION` for optimal performance on your system.
+*   **Green Box:** Recognized & Live user.
+*   **Red Box:** Unknown user or potential spoof attempt.
+*   **Stats:** FPS and processing status are displayed in real-time.
+*   **Quit:** Press `q` to exit.
